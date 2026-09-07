@@ -11,6 +11,15 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/*
+ * Define SIP_USE_PJSUA=1 and link PJSIP/PJSUA to enable the MicroSIP-style
+ * backend in sip_communication.c. Without it, the API remains available but
+ * returns an unsupported error instead of pretending to place a call.
+ */
+#ifndef SIP_USE_PJSUA
+#define SIP_USE_PJSUA 0
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -122,6 +131,16 @@ typedef struct {
     uint64_t recording_bytes;
     int last_error;
 } sip_health_t;
+
+enum {
+    SIP_OK = 0,
+    SIP_ERROR_INVALID_ARGUMENT = -1,
+    SIP_ERROR_NOT_INITIALIZED = -2,
+    SIP_ERROR_NOT_CONNECTED = -3,
+    SIP_ERROR_UNSUPPORTED = -4,
+    SIP_ERROR_BACKEND = -5,
+    SIP_ERROR_NOT_FOUND = -6
+};
 
 /**
  * Initialise the SIP line with static credentials and network details.

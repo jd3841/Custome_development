@@ -1,34 +1,274 @@
 #include "sip_communication.h"
+
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#if SIP_USE_PJSUA
+#include <pjsua-lib/pjsua.h>
+#endif
+
+static const sip_config_t *g_config;
+static sip_health_t g_health;
+static char g_input_device[32] = "default";
+static char g_output_device[32] = "default";
+
+static void set_error(int error);
+
+#if SIP_USE_PJSUA
+static pjsua_acc_id g_account = PJSUA_INVALID_ID;
+static pjsua_call_id g_call = PJSUA_INVALID_ID;
+static pjsua_recorder_id g_recorder = PJSUA_INVALID_ID;
+static int g_pjsua_started;
+
+static void on_registration_state(
+    pjsua_acc_id account_id,
+    pjsua_reg_info *registration)
+{
+    (void)account_id;
+    if (registration && registration->cbparam &&
+        registration->cbparam->code >= 200 &&
+        registration->cbparam->code < 300) {
+        g_health.status = SIP_STATUS_REGISTERED;
+        g_health.internet_connected = true;
+        g_health.registered = true;
+        g_health.last_error = 0;
+    } else {
+        g_health.registered = false;
+        set_error(SIP_ERROR_BACKEND);
+    }
+}
+#endif
+
+static uint32_t now_ms(void)
+{
+    return (uint32_t)((uint64_t)clock() * 1000U / (uint64_t)CLOCKS_PER_SEC);
+}
+
+static void set_error(int error)
+{
+    g_health.status = SIP_STATUS_ERROR;
+    g_health.last_error = error;
+}
+
+#if SIP_USE_PJSUA
+static int parse_device_id(const char *device_id)
+{
+    char *end;
+    long value;
+
+    if (!device_id || strcmp(device_id, "default") == 0) {
+        return PJMEDIA_AUD_DEFAULT_CAPTURE_DEV;
+    }
+    value = strtol(device_id, &end, 10);
+    if (*device_id == '\0' || *end != '\0' || value < 0) {
+        return -1;
+    }
+    return (int)value;
+}
+
+static int apply_audio_devices(void)
+{
+    pjsua_snd_dev_param params;
+    int input = parse_device_id(g_input_device);
+    int output = parse_device_id(g_output_device);
+
+    if (input < 0 || output < 0) {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+    pjsua_snd_dev_param_default(&params);
+    params.capture_dev = input;
+    params.playback_dev = output;
+    return pjsua_set_snd_dev2(&params) == PJ_SUCCESS
+        ? SIP_OK : SIP_ERROR_BACKEND;
+}
+#endif
 
 int sip_init(const sip_config_t *config)
 {
-    (void)config;
-    return 0;
+    if (!config || !config->sip_number || !config->sip_password ||
+        !config->sip_server) {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+
+    memset(&g_health, 0, sizeof(g_health));
+    g_config = config;
+    g_health.status = SIP_STATUS_OFFLINE;
+    strncpy(g_input_device, config->microphone_device_id
+        ? config->microphone_device_id : "default", sizeof(g_input_device) - 1);
+    strncpy(g_output_device, config->speaker_device_id
+        ? config->speaker_device_id : "default", sizeof(g_output_device) - 1);
+    g_input_device[sizeof(g_input_device) - 1] = '\0';
+    g_output_device[sizeof(g_output_device) - 1] = '\0';
+
+#if SIP_USE_PJSUA
+    {
+        pjsua_config ua_config;
+        pjsua_logging_config logging_config;
+        pjsua_media_config media_config;
+        pjsua_transport_config transport_config;
+        pjsua_acc_config account_config;
+        pjsua_transport_id transport_id;
+        pj_status_t status;
+        char identity[256];
+        char registrar[256];
+
+        pjsua_config_default(&ua_config);
+        ua_config.cb.on_reg_state2 = &on_registration_state;
+        pjsua_logging_config_default(&logging_config);
+        pjsua_media_config_default(&media_config);
+        status = pjsua_create();
+        if (status != PJ_SUCCESS) {
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        status = pjsua_init(&ua_config, &logging_config, &media_config);
+        if (status != PJ_SUCCESS) {
+            pjsua_destroy();
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        pjsua_transport_config_default(&transport_config);
+        transport_config.port = config->sip_port;
+        status = pjsua_transport_create(PJSIP_TRANSPORT_UDP,
+            &transport_config, &transport_id);
+        if (status != PJ_SUCCESS) {
+            pjsua_destroy();
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        status = pjsua_start();
+        if (status != PJ_SUCCESS) {
+            pjsua_destroy();
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        g_pjsua_started = 1;
+        snprintf(identity, sizeof(identity), "sip:%s@%s",
+            config->sip_number, config->sip_server);
+        snprintf(registrar, sizeof(registrar), "sip:%s:%u",
+            config->sip_server, (unsigned)config->sip_port);
+        pjsua_acc_config_default(&account_config);
+        account_config.id = pj_str(identity);
+        account_config.reg_uri = pj_str(registrar);
+        account_config.cred_count = 1;
+        account_config.cred_info[0].realm = pj_str("*");
+        account_config.cred_info[0].scheme = pj_str("digest");
+        account_config.cred_info[0].username = pj_str((char *)config->sip_number);
+        account_config.cred_info[0].data_type = PJSIP_CRED_DATA_PLAIN_PASSWD;
+        account_config.cred_info[0].data = pj_str((char *)config->sip_password);
+        status = pjsua_acc_add(&account_config, PJ_TRUE, &g_account);
+        if (status != PJ_SUCCESS) {
+            pjsua_destroy();
+            g_pjsua_started = 0;
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        apply_audio_devices();
+    }
+#endif
+    return SIP_OK;
 }
 
 int sip_connect(void)
 {
-    return 0;
+    if (!g_config) {
+        return SIP_ERROR_NOT_INITIALIZED;
+    }
+#if SIP_USE_PJSUA
+    if (!g_pjsua_started || g_account == PJSUA_INVALID_ID) {
+        return SIP_ERROR_NOT_CONNECTED;
+    }
+#endif
+    g_health.status = SIP_STATUS_CONNECTING;
+    g_health.internet_connected = true;
+    g_health.last_error = 0;
+    return SIP_OK;
 }
 
 int sip_trigger_call(const char *destination_sip_uri)
 {
-    printf("[stub] sip_trigger_call('%s')\n", destination_sip_uri ? destination_sip_uri : "(null)");
-    return 0;
+    if (!g_config || !destination_sip_uri || destination_sip_uri[0] == '\0') {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+#if SIP_USE_PJSUA
+    {
+        pj_str_t uri = pj_str((char *)destination_sip_uri);
+        pj_status_t status = pjsua_call_make_call(g_account, &uri, NULL,
+            NULL, NULL, &g_call);
+        if (status != PJ_SUCCESS) {
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+    }
+#else
+    (void)destination_sip_uri;
+    set_error(SIP_ERROR_UNSUPPORTED);
+    return SIP_ERROR_UNSUPPORTED;
+#endif
+    g_health.status = SIP_STATUS_CALLING;
+    return SIP_OK;
 }
 
 int sip_start_recording(const char *recording_folder)
 {
-    printf("[stub] sip_start_recording('%s')\n", recording_folder ? recording_folder : "(null)");
-    return 0;
+    if (!g_config || !recording_folder || recording_folder[0] == '\0') {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!g_config->recording_enabled) {
+        return SIP_ERROR_UNSUPPORTED;
+    }
+#if SIP_USE_PJSUA
+    {
+        char filename[512];
+        pj_str_t path;
+        pjsua_conf_port_id recorder_port;
+        if (g_call == PJSUA_INVALID_ID) {
+            return SIP_ERROR_NOT_CONNECTED;
+        }
+        snprintf(filename, sizeof(filename), "%s/sip-%lu.wav",
+            recording_folder, (unsigned long)time(NULL));
+        path = pj_str(filename);
+        if (pjsua_recorder_create(&path, 0, NULL, -1, 0, &g_recorder)
+            != PJ_SUCCESS) {
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        recorder_port = pjsua_recorder_get_conf_port(g_recorder);
+        if (pjsua_conf_connect(pjsua_call_get_conf_port(g_call),
+            recorder_port) != PJ_SUCCESS) {
+            pjsua_recorder_destroy(g_recorder);
+            g_recorder = PJSUA_INVALID_ID;
+            set_error(SIP_ERROR_BACKEND);
+            return SIP_ERROR_BACKEND;
+        }
+        pjsua_conf_connect(0, recorder_port);
+    }
+#else
+    (void)recording_folder;
+    set_error(SIP_ERROR_UNSUPPORTED);
+    return SIP_ERROR_UNSUPPORTED;
+#endif
+    g_health.recording = true;
+    return SIP_OK;
 }
 
 int sip_stop_recording(void)
 {
-    printf("[stub] sip_stop_recording()\n");
-    return 0;
+#if SIP_USE_PJSUA
+    if (g_recorder != PJSUA_INVALID_ID) {
+        pjsua_recorder_destroy(g_recorder);
+        g_recorder = PJSUA_INVALID_ID;
+    }
+#else
+    if (!g_health.recording) {
+        return SIP_OK;
+    }
+    return SIP_ERROR_UNSUPPORTED;
+#endif
+    g_health.recording = false;
+    return SIP_OK;
 }
 
 int sip_list_audio_devices(
@@ -36,55 +276,110 @@ int sip_list_audio_devices(
     sip_audio_device_t *devices,
     uint32_t max_devices)
 {
-    (void)direction;
-    if (devices == NULL) {
-        return 0; /* no devices */
+#if SIP_USE_PJSUA
+    pjmedia_aud_dev_info info[PJMEDIA_AUD_MAX_DEVS];
+    unsigned count = PJMEDIA_AUD_MAX_DEVS;
+    unsigned found = 0;
+    unsigned i;
+    if (pjsua_enum_aud_devs(info, &count) != PJ_SUCCESS) {
+        return SIP_ERROR_BACKEND;
     }
+    for (i = 0; i < count; ++i) {
+        bool match = direction == SIP_AUDIO_INPUT
+            ? info[i].input_count > 0 : info[i].output_count > 0;
+        if (match) {
+            if (devices && found < max_devices) {
+                static char ids[PJMEDIA_AUD_MAX_DEVS][16];
+                snprintf(ids[found], sizeof(ids[found]), "%u", i);
+                devices[found].id = ids[found];
+                devices[found].name = info[i].name;
+                devices[found].direction = direction;
+                devices[found].available = true;
+            }
+            ++found;
+        }
+    }
+    return (int)found;
+#else
+    (void)direction;
+    (void)devices;
     (void)max_devices;
-    return 0;
+    return SIP_ERROR_UNSUPPORTED;
+#endif
 }
 
 int sip_select_audio_device(
     sip_audio_direction_t direction,
     const char *device_id)
 {
-    (void)direction; (void)device_id;
-    return 0;
+    if (!device_id || device_id[0] == '\0') {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+    if (direction == SIP_AUDIO_INPUT) {
+        strncpy(g_input_device, device_id, sizeof(g_input_device) - 1);
+        g_input_device[sizeof(g_input_device) - 1] = '\0';
+    } else if (direction == SIP_AUDIO_OUTPUT) {
+        strncpy(g_output_device, device_id, sizeof(g_output_device) - 1);
+        g_output_device[sizeof(g_output_device) - 1] = '\0';
+    } else {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+#if SIP_USE_PJSUA
+    return apply_audio_devices();
+#else
+    return SIP_ERROR_UNSUPPORTED;
+#endif
 }
 
 int sip_get_audio_device(
     sip_audio_direction_t direction,
     sip_audio_device_t *device)
 {
-    (void)direction;
-    if (device) {
-        device->id = "default";
-        device->name = "Default Device";
-        device->direction = SIP_AUDIO_INPUT;
-        device->available = true;
+    if (!device) {
+        return SIP_ERROR_INVALID_ARGUMENT;
     }
-    return 0;
+    if (direction == SIP_AUDIO_INPUT) {
+        device->id = g_input_device;
+    } else if (direction == SIP_AUDIO_OUTPUT) {
+        device->id = g_output_device;
+    } else {
+        return SIP_ERROR_INVALID_ARGUMENT;
+    }
+    device->name = device->id;
+    device->direction = direction;
+    device->available = true;
+    return SIP_OK;
 }
 
 int sip_send_heartbeat(void)
 {
-    return 0;
+    if (!g_config) {
+        return SIP_ERROR_NOT_INITIALIZED;
+    }
+    g_health.heartbeat_age_ms = now_ms();
+    return SIP_OK;
 }
 
 int sip_get_health(sip_health_t *health)
 {
-    if (health) {
-        health->status = SIP_STATUS_REGISTERED;
-        health->internet_connected = true;
-        health->registered = true;
-        health->recording = false;
-        health->heartbeat_age_ms = 0;
-        health->recording_bytes = 0;
-        health->last_error = 0;
+    if (!health) {
+        return SIP_ERROR_INVALID_ARGUMENT;
     }
-    return 0;
+    *health = g_health;
+    return SIP_OK;
 }
 
 void sip_shutdown(void)
 {
+    sip_stop_recording();
+#if SIP_USE_PJSUA
+    if (g_pjsua_started) {
+        pjsua_destroy();
+    }
+    g_pjsua_started = 0;
+    g_account = PJSUA_INVALID_ID;
+    g_call = PJSUA_INVALID_ID;
+#endif
+    g_config = NULL;
+    memset(&g_health, 0, sizeof(g_health));
 }

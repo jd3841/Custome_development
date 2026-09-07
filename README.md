@@ -25,3 +25,12 @@ destination SIP URI, then connect `one_button_call()` to the physical button
 or UI event in the target application. The sample console loop uses `c` as
 the button action and `q` to exit. Link the file with the implementation of
 the functions declared in `sip_communication.h`.
+
+## PJSIP/MicroSIP backend
+
+The implementation follows the PJSUA integration points used by the attached
+MicroSIP 3.22.3 source: PJSUA account registration and call creation, audio
+device enumeration and switching, and conference-bridge recording. Define
+`SIP_USE_PJSUA=1` and link the PJSIP/PJMEDIA libraries from the MicroSIP build
+environment to enable this backend. Without that define, unsupported operations
+return `SIP_ERROR_UNSUPPORTED`; no fake call is reported as successful.
