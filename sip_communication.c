@@ -13,6 +13,9 @@ static const sip_config_t *g_config;
 static sip_health_t g_health;
 static char g_input_device[32] = "default";
 static char g_output_device[32] = "default";
+static uint64_t g_recording_start_time;
+static uint64_t g_call_start_time;
+static uint64_t g_last_heartbeat_time;
 
 static void set_error(int error);
 
@@ -27,24 +30,67 @@ static void on_registration_state(
     pjsua_reg_info *registration)
 {
     (void)account_id;
-    if (registration && registration->cbparam &&
-        registration->cbparam->code >= 200 &&
-        registration->cbparam->code < 300) {
-        g_health.status = SIP_STATUS_REGISTERED;
-        g_health.internet_connected = true;
-        g_health.registered = true;
-        g_health.last_error = 0;
-    } else {
-        g_health.registered = false;
-        set_error(SIP_ERROR_BACKEND);
+    if (registration && registration->cbparam) {
+        if (registration->cbparam->code >= 200 &&
+            registration->cbparam->code < 300) {
+            g_health.status = SIP_STATUS_REGISTERED;
+            g_health.internet_connected = true;
+            g_health.registered = true;
+            g_health.last_error = 0;
+            fprintf(stderr, "[SIP] Registration successful (code %d)\n",
+                registration->cbparam->code);
+        } else {
+            g_health.registered = false;
+            g_health.internet_connected = false;
+            set_error(SIP_ERROR_BACKEND);
+            fprintf(stderr, "[SIP] Registration failed (code %d)\n",
+                registration->cbparam->code);
+        }
     }
 }
-#endif
+
+static void on_call_state(pjsua_call_id call_id, pjsip_event *event)
+{
+    pjsua_call_info call_info;
+    
+    (void)event;
+    
+    if (pjsua_call_get_info(call_id, &call_info) != PJ_SUCCESS) {
+        return;
+    }
+    
+    fprintf(stderr, "[SIP] Call state changed: %s (state=%d, media=%d)\n",
+        call_info.state_text.ptr, call_info.state, call_info.media_status);
+    
+    switch (call_info.state) {
+        case PJSIP_INV_STATE_CALLING:
+            g_health.status = SIP_STATUS_CALLING;
+            g_call_start_time = (uint64_t)time(NULL);
+            break;
+        case PJSIP_INV_STATE_EARLY:
+            g_health.status = SIP_STATUS_CALLING;
+            break;
+        case PJSIP_INV_STATE_CONFIRMED:
+            g_health.status = SIP_STATUS_IN_CALL;
+            g_call_start_time = (uint64_t)time(NULL);
+            break;
+        case PJSIP_INV_STATE_DISCONNECTED:
+            if (g_recorder != PJSUA_INVALID_ID) {
+                sip_stop_recording();
+            }
+            g_health.status = SIP_STATUS_REGISTERED;
+            g_call = PJSUA_INVALID_ID;
+            break;
+        default:
+            break;
+    }
+}
 
 static uint32_t now_ms(void)
 {
     return (uint32_t)((uint64_t)clock() * 1000U / (uint64_t)CLOCKS_PER_SEC);
 }
+#endif
 
 static void set_error(int error)
 {
@@ -116,7 +162,12 @@ int sip_init(const sip_config_t *config)
 
         pjsua_config_default(&ua_config);
         ua_config.cb.on_reg_state2 = &on_registration_state;
-        pjsua_logging_config_default(&logging_config);
+            ua_config.cb.on_call_state = &on_call_state;
+            ua_config.thread_cnt = 1;
+            ua_config.nameserver_count = 1;
+            if (config->dns_server && config->dns_server[0] != '\0') {
+                ua_config.nameserver[0] = pj_str((char *)config->dns_server);
+            }
         pjsua_media_config_default(&media_config);
         status = pjsua_create();
         if (status != PJ_SUCCESS) {
@@ -174,12 +225,15 @@ int sip_init(const sip_config_t *config)
 int sip_connect(void)
 {
     if (!g_config) {
+        fprintf(stderr, "[SIP] Not initialized\n");
         return SIP_ERROR_NOT_INITIALIZED;
     }
 #if SIP_USE_PJSUA
     if (!g_pjsua_started || g_account == PJSUA_INVALID_ID) {
+        fprintf(stderr, "[SIP] PJSUA not started or account not registered\n");
         return SIP_ERROR_NOT_CONNECTED;
     }
+    fprintf(stderr, "[SIP] Waiting for registration...\n");
 #endif
     g_health.status = SIP_STATUS_CONNECTING;
     g_health.internet_connected = true;
@@ -190,20 +244,27 @@ int sip_connect(void)
 int sip_trigger_call(const char *destination_sip_uri)
 {
     if (!g_config || !destination_sip_uri || destination_sip_uri[0] == '\0') {
+        fprintf(stderr, "[SIP] Invalid trigger_call parameters\n");
         return SIP_ERROR_INVALID_ARGUMENT;
     }
+    
+    fprintf(stderr, "[SIP] Triggering call to: %s\n", destination_sip_uri);
+    
 #if SIP_USE_PJSUA
     {
         pj_str_t uri = pj_str((char *)destination_sip_uri);
         pj_status_t status = pjsua_call_make_call(g_account, &uri, NULL,
             NULL, NULL, &g_call);
         if (status != PJ_SUCCESS) {
+            fprintf(stderr, "[SIP] Call failed with status: %d\n", status);
             set_error(SIP_ERROR_BACKEND);
             return SIP_ERROR_BACKEND;
         }
+        fprintf(stderr, "[SIP] Call initiated successfully\n");
     }
 #else
     (void)destination_sip_uri;
+    fprintf(stderr, "[SIP] PJSUA not enabled, call not supported\n");
     set_error(SIP_ERROR_UNSUPPORTED);
     return SIP_ERROR_UNSUPPORTED;
 #endif
@@ -224,26 +285,44 @@ int sip_start_recording(const char *recording_folder)
         char filename[512];
         pj_str_t path;
         pjsua_conf_port_id recorder_port;
+        time_t now = time(NULL);
+        struct tm *timeinfo = localtime(&now);
+        
         if (g_call == PJSUA_INVALID_ID) {
             return SIP_ERROR_NOT_CONNECTED;
         }
-        snprintf(filename, sizeof(filename), "%s/sip-%lu.wav",
-            recording_folder, (unsigned long)time(NULL));
+        snprintf(filename, sizeof(filename),
+            "%s/sip_call_%04d%02d%02d_%02d%02d%02d.wav",
+            recording_folder,
+            timeinfo->tm_year + 1900,
+            timeinfo->tm_mon + 1,
+            timeinfo->tm_mday,
+            timeinfo->tm_hour,
+            timeinfo->tm_min,
+            timeinfo->tm_sec);
+        
         path = pj_str(filename);
         if (pjsua_recorder_create(&path, 0, NULL, -1, 0, &g_recorder)
             != PJ_SUCCESS) {
+            fprintf(stderr, "[SIP] Failed to create recorder at %s\n",
+                filename);
             set_error(SIP_ERROR_BACKEND);
             return SIP_ERROR_BACKEND;
         }
+        
         recorder_port = pjsua_recorder_get_conf_port(g_recorder);
         if (pjsua_conf_connect(pjsua_call_get_conf_port(g_call),
             recorder_port) != PJ_SUCCESS) {
+            fprintf(stderr, "[SIP] Failed to connect call to recorder\n");
             pjsua_recorder_destroy(g_recorder);
             g_recorder = PJSUA_INVALID_ID;
             set_error(SIP_ERROR_BACKEND);
             return SIP_ERROR_BACKEND;
         }
         pjsua_conf_connect(0, recorder_port);
+        
+        g_recording_start_time = (uint64_t)now;
+        fprintf(stderr, "[SIP] Recording started: %s\n", filename);
     }
 #else
     (void)recording_folder;
@@ -251,6 +330,7 @@ int sip_start_recording(const char *recording_folder)
     return SIP_ERROR_UNSUPPORTED;
 #endif
     g_health.recording = true;
+    g_health.recording_bytes = 0;
     return SIP_OK;
 }
 
@@ -356,7 +436,25 @@ int sip_send_heartbeat(void)
     if (!g_config) {
         return SIP_ERROR_NOT_INITIALIZED;
     }
-    g_health.heartbeat_age_ms = now_ms();
+#if SIP_USE_PJSUA
+    uint64_t current_time = (uint64_t)time(NULL);
+    
+    g_last_heartbeat_time = current_time;
+    g_health.heartbeat_age_ms = now_ms() % 1000;
+    
+    if (g_call != PJSUA_INVALID_ID && g_call_start_time > 0) {
+        uint64_t call_duration = current_time - g_call_start_time;
+        fprintf(stderr, "[SIP] Heartbeat - Call duration: %llu seconds\n",
+            (unsigned long long)call_duration);
+    }
+    
+    if (g_health.recording && g_recording_start_time > 0) {
+        uint64_t recording_duration = current_time - g_recording_start_time;
+        g_health.recording_bytes = recording_duration * 16000 * 2 / 8;
+        fprintf(stderr, "[SIP] Heartbeat - Recording: %llu bytes\n",
+            (unsigned long long)g_health.recording_bytes);
+    }
+#endif
     return SIP_OK;
 }
 
@@ -371,15 +469,32 @@ int sip_get_health(sip_health_t *health)
 
 void sip_shutdown(void)
 {
+    fprintf(stderr, "[SIP] Shutdown initiated\n");
+    
     sip_stop_recording();
+    
 #if SIP_USE_PJSUA
+    if (g_call != PJSUA_INVALID_ID) {
+        fprintf(stderr, "[SIP] Hanging up active call\n");
+        pjsua_call_hangup(g_call, 200, NULL, NULL);
+        g_call = PJSUA_INVALID_ID;
+    }
+    
     if (g_pjsua_started) {
+        fprintf(stderr, "[SIP] Destroying PJSUA\n");
         pjsua_destroy();
     }
     g_pjsua_started = 0;
     g_account = PJSUA_INVALID_ID;
     g_call = PJSUA_INVALID_ID;
+    g_recorder = PJSUA_INVALID_ID;
 #endif
+    
     g_config = NULL;
+    g_call_start_time = 0;
+    g_recording_start_time = 0;
+    g_last_heartbeat_time = 0;
     memset(&g_health, 0, sizeof(g_health));
+    
+    fprintf(stderr, "[SIP] Shutdown complete\n");
 }

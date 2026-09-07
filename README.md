@@ -34,3 +34,20 @@ device enumeration and switching, and conference-bridge recording. Define
 `SIP_USE_PJSUA=1` and link the PJSIP/PJMEDIA libraries from the MicroSIP build
 environment to enable this backend. Without that define, unsupported operations
 return `SIP_ERROR_UNSUPPORTED`; no fake call is reported as successful.
+
+## Enhanced features
+
+The SIP communication library includes:
+
+- **Call state tracking**: Automatic state transitions on calling, early media,
+  confirmed, and disconnected events.
+- **Registration callbacks**: Real-time SIP registration status with detailed
+  HTTP response codes.
+- **Recording file management**: Automatic filename generation using ISO 8601
+  timestamps; recordings are closed immediately on call disconnect.
+- **Heartbeat monitoring**: Duration tracking for active calls and recording
+  sessions with estimated bytes recorded.
+- **Comprehensive logging**: Debug output on stderr for initialization, calls,
+  recording, device selection, and shutdown.
+- **Error reporting**: Specific error codes for invalid arguments, uninitialized
+  state, backend failures, and unsupported operations.
